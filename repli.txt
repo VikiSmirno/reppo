@@ -1,0 +1,28 @@
+!pip install -q streamlit
+!npm install localtunnel
+
+2. Создайте файл приложения ( app.py ):
+%writefile app.py
+
+import streamlit as st
+st.title('Hello, World!')
+
+3. Запустите Streamlit и получите публичную ссылку:
+1. Сначала узнайте свой публичный IP-адрес:
+
+python
+!wget -q -O - ipv4.icanhazip.com
+
+2. Запустите приложение в фоне:
+python
+
+!streamlit run app.py &>/content/logs.txt &
+
+3. Запустите localtunnel (порт 8501):
+python
+
+!npx localtunnel --port 8501
+
+4. Откройте ссылку: В выводе команды localtunnel появится адрес (например, https://...localtunnel.me ). Перейдите по нему.
+
+5. Введите IP: В открывшемся окне введите IP-адрес, полученный на шаге 3.

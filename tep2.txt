@@ -1,0 +1,147 @@
+Этап 2. Конструирование признаков (Feature Engineering)
+
+
+import pandas as pd
+import numpy as np
+
+def safe_div(numerator, denominator, fill_value=0):
+    """
+    Безопасное деление. Возвращает fill_value там, где знаменатель равен 0.
+    """
+    return np.where(
+        denominator != 0, 
+        numerator / denominator, 
+        fill_value
+    )
+
+def perform_feature_engineering(df: pd.DataFrame, features_config: list, drop_cols: list = None):
+    """
+    Универсальная функция для генерации признаков и очистки от идентификаторов.
+    
+    Параметры:
+    df (pd.DataFrame): Исходный датафрейм.
+    features_config (list): Список словарей с инструкциями для создания признаков.
+        Формат словаря:
+        {
+            'name': 'Имя_Новой_Колонки',
+            'type': 'sum' | 'diff' | 'product' | 'ratio' | 'custom',
+            'columns': ['col1', 'col2'] (для sum/product) ИЛИ
+            'numerator': 'col1', 'denominator': 'col2' (для ratio) ИЛИ
+            'func': lambda x: ... (для custom)
+        }
+    drop_cols (list): Список колонок-идентификаторов для удаления.
+    """
+    
+    df_fe = df.copy()
+    
+    print("="*50)
+    print("ЭТАП 2: КОНСТРУИРОВАНИЕ ПРИЗНАКОВ (FEATURE ENGINEERING)")
+    print("="*50)
+    
+    # ---------------------------------------------------------
+    # 1. Генерация экспертных признаков
+    # ---------------------------------------------------------
+    print(f"\n[1] ГЕНЕРАЦИЯ НОВЫХ ПРИЗНАКОВ")
+    
+    created_features = []
+    
+    for item in features_config:
+        new_col = item['name']
+        ft_type = item['type']
+        
+        try:
+            if ft_type == 'sum':
+                # Сумма указанных колонок
+                cols = item['columns']
+                df_fe[new_col] = df_fe[cols].sum(axis=1)
+                desc = f"Сумма {cols}"
+                
+            elif ft_type == 'diff':
+                # Разница (col1 - col2)
+                c1, c2 = item['columns'][0], item['columns'][1]
+                df_fe[new_col] = df_fe[c1] - df_fe[c2]
+                desc = f"{c1} - {c2}"
+
+            elif ft_type == 'product':
+                # Произведение указанных колонок
+                cols = item['columns']
+                df_fe[new_col] = df_fe[cols].prod(axis=1)
+                desc = f"Произведение {cols}"
+                
+            elif ft_type == 'ratio':
+                # Отношение (Деление с защитой от нуля)
+                num = item['numerator']
+                den = item['denominator']
+                df_fe[new_col] = safe_div(df_fe[num], df_fe[den])
+                desc = f"Отношение {num} / {den}"
+                
+            elif ft_type == 'custom':
+                # Произвольная лямбда-функция
+                func = item['func']
+                df_fe[new_col] = df_fe.apply(func, axis=1)
+                desc = "Пользовательская формула"
+            
+            created_features.append(new_col)
+            print(f"  [OK] Создан признак '{new_col}': {desc}")
+            
+        except KeyError as e:
+            print(f"  [ERROR] Ошибка при создании '{new_col}': не найдена колонка {e}")
+        except Exception as e:
+            print(f"  [ERROR] Ошибка при создании '{new_col}': {e}")
+
+    # ---------------------------------------------------------
+    # 2. Удаление идентификаторов
+    # ---------------------------------------------------------
+    print(f"\n[2] УДАЛЕНИЕ НЕНУЖНЫХ КОЛОНОК (ID)")
+    
+    if drop_cols:
+        existing_drop_cols = [c for c in drop_cols if c in df_fe.columns]
+        missing_drop_cols = [c for c in drop_cols if c not in df_fe.columns]
+        
+        if existing_drop_cols:
+            df_fe = df_fe.drop(columns=existing_drop_cols)
+            print(f"  Удалены колонки: {existing_drop_cols}")
+        
+        if missing_drop_cols:
+            print(f"  Пропущены (не найдены): {missing_drop_cols}")
+    else:
+        print("  Список колонок для удаления пуст.")
+
+    # ---------------------------------------------------------
+    # 3. Финальная сводка
+    # ---------------------------------------------------------
+    print(f"\nИтоговая размерность: {df_fe.shape}")
+    print("="*50)
+    
+    return df_fe
+
+# --- ПРИМЕР ИСПОЛЬЗОВАНИЯ (на основе вашего кейса) ---
+
+# 1. Конфигурация ("Рецепт")
+# engineering_config = [
+#     # Агрегация (Сумма потоков)
+#     {
+#         'name': 'Суммарная_сила_потоков', 
+#         'type': 'sum', 
+#         'columns': ['Сила левого Потока', 'Сила Правого Потока', 'Приток Силы Потока']
+#     },
+#     # Произведение (Сила ядра)
+#     {
+#         'name': 'Общая_сила_ядра', 
+#         'type': 'product', 
+#         'columns': ['Ритм магического ядра', 'Приток Силы Потока']
+#     },
+#     # Отношение (Производительность) - ВАЖНО: здесь сработает защита от деления на 0
+#     {
+#         'name': 'Магическая_производительность', 
+#         'type': 'ratio', 
+#         'numerator': 'Скорость перехода через портал', 
+#         'denominator': 'Эмульсия Истока'
+#     }
+# ]
+
+# 2. Список ID для удаления
+# ids_to_drop = ['Номер пометки', 'User_ID']
+
+# 3. Запуск
+# df_engineered = perform_feature_engineering(df_processed, engineering_config, ids_to_drop)

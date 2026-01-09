@@ -1,0 +1,249 @@
+Этап 3. Продвинутая обработка пропущенных значений
+
+
+import pandas as pd
+import numpy as np
+from sklearn.experimental import enable_iterative_imputer  # Необходим для активации MICE
+from sklearn.impute import SimpleImputer, KNNImputer, IterativeImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error
+from scipy import stats
+
+def calculate_nrmse(y_true, y_pred):
+    """Вычисляет NRMSE (Нормированная среднеквадратичная ошибка)."""
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    data_range = y_true.max() - y_true.min()
+    if data_range == 0:
+        return 0.0
+    return rmse / data_range
+
+def calculate_kl_divergence(original, imputed, bins=50):
+    """
+    Вычисляет дивергенцию Кульбака-Лейблера для оценки искажения распределения.
+    Меньше = Лучше.
+    """
+    # Удаляем NaN из оригинала для построения гистограммы
+    original_clean = original.dropna()
+    
+    # Вычисляем границы бинов на основе объединения данных (чтобы шкала была одинаковой)
+    combined = np.concatenate([original_clean, imputed])
+    hist_range = (combined.min(), combined.max())
+    
+    # Вычисляем гистограммы (плотности вероятности)
+    orig_hist, _ = np.histogram(original_clean, bins=bins, range=hist_range, density=True)
+    imp_hist, _ = np.histogram(imputed, bins=bins, range=hist_range, density=True)
+    
+    # Сглаживание (избегаем деления на 0)
+    epsilon = 1e-10
+    orig_hist += epsilon
+    imp_hist += epsilon
+    
+    # KL(P || Q) = sum(P * log(P / Q))
+    return stats.entropy(orig_hist, imp_hist)
+
+def run_synthetic_test(df_complete, imputer_instance, scale=False, missing_fraction=0.2):
+    """
+    Проводит эксперимент: портит 'чистые' данные и пытается их восстановить.
+    Возвращает средний NRMSE.
+    """
+    # Создаем маску пропусков
+    df_masked = df_complete.copy()
+    mask = np.random.rand(*df_masked.shape) < missing_fraction
+    df_masked[mask] = np.nan
+    
+    # Логика для KNN (нуждается в масштабировании)
+    if scale:
+        scaler = StandardScaler()
+        # Обучаем скейлер на данных с пропусками (sklearn это умеет)
+        df_scaled = pd.DataFrame(scaler.fit_transform(df_masked), columns=df_masked.columns)
+        
+        # Импутация
+        imputed_scaled = imputer_instance.fit_transform(df_scaled)
+        
+        # Возврат к исходному масштабу
+        imputed_data = scaler.inverse_transform(imputed_scaled)
+        df_imputed = pd.DataFrame(imputed_data, columns=df_masked.columns, index=df_masked.index)
+    else:
+        # Обычная импутация
+        imputed_data = imputer_instance.fit_transform(df_masked)
+        df_imputed = pd.DataFrame(imputed_data, columns=df_masked.columns, index=df_masked.index)
+    
+    # Считаем ошибку только по тем ячейкам, которые стерли
+    nrmse_scores = []
+    for col in df_complete.columns:
+        # Индексы, где был искусственный пропуск
+        missing_indices = mask[:, df_complete.columns.get_loc(col)]
+        if missing_indices.sum() > 0:
+            true_vals = df_complete.loc[missing_indices, col]
+            pred_vals = df_imputed.loc[missing_indices, col]
+            nrmse_scores.append(calculate_nrmse(true_vals, pred_vals))
+            
+    return np.mean(nrmse_scores) if nrmse_scores else None
+
+def perform_advanced_imputation(df: pd.DataFrame, drop_threshold: float = 0.7, target_col: str = None):
+    """
+    Универсальный пайплайн этапа 3: Диагностика -> Сравнение -> Заполнение.
+    """
+    df_clean = df.copy()
+    
+    print("="*60)
+    print("ЭТАП 3: ПРОДВИНУТАЯ ОБРАБОТКА ПРОПУЩЕННЫХ ЗНАЧЕНИЙ")
+    print("="*60)
+    
+    # ---------------------------------------------------------
+    # 1. Диагностика и удаление "безнадежных" колонок
+    # ---------------------------------------------------------
+    print(f"\n[1] ДИАГНОСТИКА ПРОПУСКОВ")
+    missing_percent = df_clean.isnull().mean()
+    cols_to_drop = missing_percent[missing_percent > drop_threshold].index.tolist()
+    
+    if cols_to_drop:
+        print(f"Обнаружены колонки с >{drop_threshold*100}% пропусков:")
+        for col in cols_to_drop:
+            print(f"  - {col}: {missing_percent[col]:.2%}")
+        df_clean = df_clean.drop(columns=cols_to_drop)
+        print("-> Колонки удалены.")
+    else:
+        print(f"Колонок с пропусками более {drop_threshold*100}% не обнаружено.")
+        
+    # Определяем, что осталось заполнить (только числовые)
+    # Категориальные (object) лучше заполнять отдельно модой, KNN для них требует кодирования.
+    numeric_cols_with_missing = [
+        col for col in df_clean.select_dtypes(include=[np.number]).columns 
+        if df_clean[col].isnull().any()
+    ]
+    
+    if not numeric_cols_with_missing:
+        print("\nЧисловых пропусков не осталось. Этап завершен.")
+        return df_clean
+
+    print(f"\nОсталось колонок для восстановления: {len(numeric_cols_with_missing)}")
+    print(numeric_cols_with_missing)
+
+    # ---------------------------------------------------------
+    # 2. Подготовка валидационного сета (Ground Truth)
+    # ---------------------------------------------------------
+    # Берем только числовые колонки для эксперимента
+    validation_df = df_clean.select_dtypes(include=[np.number]).dropna()
+    
+    if len(validation_df) < 50:
+        print("\n[WARNING] Слишком мало полных строк для валидации NRMSE.")
+        print("Будет использована только оценка KL-дивергенции на полных данных.")
+        run_validation = False
+    else:
+        print(f"\n[2] ПОДГОТОВКА ВАЛИДАЦИИ (NRMSE)")
+        print(f"Размер 'чистого' датасета для тестов: {validation_df.shape}")
+        run_validation = True
+        # Если есть целевая переменная, удаляем её из валидации импутации (чтобы не было утечки)
+        if target_col and target_col in validation_df.columns:
+            validation_df = validation_df.drop(columns=[target_col])
+
+    # ---------------------------------------------------------
+    # 3. Сравнение стратегий
+    # ---------------------------------------------------------
+    print(f"\n[3] СРАВНЕНИЕ АЛГОРИТМОВ")
+    
+    strategies = {
+        'Mean': (SimpleImputer(strategy='mean'), False),
+        'Median': (SimpleImputer(strategy='median'), False),
+        'KNN (k=5)': (KNNImputer(n_neighbors=5), True), # True = нужен скейлинг
+        'MICE (RF)': (IterativeImputer(max_iter=10, random_state=42), False)
+    }
+    
+    results = []
+    
+    for name, (model, need_scale) in strategies.items():
+        print(f"  Тестирование {name}...", end=" ")
+        
+        # Метрика 1: NRMSE (на синтетических пропусках)
+        nrmse = np.nan
+        if run_validation:
+            try:
+                nrmse = run_synthetic_test(validation_df, model, scale=need_scale)
+                print(f"NRMSE: {nrmse:.4f}", end=" | ")
+            except Exception as e:
+                print(f"NRMSE Error: {e}", end=" | ")
+        
+        # Метрика 2: KL-дивергенция (на реальных пропусках)
+        # Применяем модель ко всему датасету
+        try:
+            temp_df = df_clean[numeric_cols_with_missing].copy()
+            if need_scale:
+                scaler = StandardScaler()
+                temp_scaled = scaler.fit_transform(temp_df)
+                filled_scaled = model.fit_transform(temp_scaled)
+                filled_data = scaler.inverse_transform(filled_scaled)
+            else:
+                filled_data = model.fit_transform(temp_df)
+                
+            filled_df = pd.DataFrame(filled_data, columns=numeric_cols_with_missing, index=temp_df.index)
+            
+            # Считаем среднюю KL по всем колонкам
+            kl_scores = []
+            for col in numeric_cols_with_missing:
+                kl = calculate_kl_divergence(temp_df[col], filled_df[col])
+                kl_scores.append(kl)
+            avg_kl = np.mean(kl_scores)
+            print(f"KL-Div: {avg_kl:.4f}")
+            
+        except Exception as e:
+            avg_kl = np.inf
+            print(f"KL Error: {e}")
+            
+        results.append({'Method': name, 'NRMSE': nrmse, 'KL': avg_kl, 'Model': model, 'Scale': need_scale})
+
+    # ---------------------------------------------------------
+    # 4. Выбор победителя
+    # ---------------------------------------------------------
+    results_df = pd.DataFrame(results)
+    
+    # Логика выбора: Если есть NRMSE, верим ей. Если нет - верим KL.
+    if run_validation:
+        best_row = results_df.sort_values('NRMSE').iloc[0]
+        metric_name = 'NRMSE'
+    else:
+        best_row = results_df.sort_values('KL').iloc[0]
+        metric_name = 'KL'
+        
+    winner_name = best_row['Method']
+    winner_model = best_row['Model']
+    winner_needs_scale = best_row['Scale']
+    
+    print(f"\n>>> ПОБЕДИТЕЛЬ: {winner_name} (Лучший {metric_name})")
+    print(results_df[['Method', 'NRMSE', 'KL']])
+
+    # ---------------------------------------------------------
+    # 5. Финальное заполнение
+    # ---------------------------------------------------------
+    print(f"\n[4] ПРИМЕНЕНИЕ {winner_name} КО ВСЕМУ ДАТАСЕТУ")
+    
+    # Работаем со всем датасетом, но заполняем только numeric columns
+    # Остальные колонки оставляем как есть
+    
+    numeric_df = df_clean.select_dtypes(include=[np.number])
+    non_numeric_df = df_clean.select_dtypes(exclude=[np.number])
+    
+    if winner_needs_scale:
+        scaler = StandardScaler()
+        scaled_values = scaler.fit_transform(numeric_df)
+        imputed_values_scaled = winner_model.fit_transform(scaled_values)
+        imputed_values = scaler.inverse_transform(imputed_values_scaled)
+    else:
+        imputed_values = winner_model.fit_transform(numeric_df)
+        
+    df_imputed_numeric = pd.DataFrame(imputed_values, columns=numeric_df.columns, index=numeric_df.index)
+    
+    # Собираем обратно
+    df_final = pd.concat([df_imputed_numeric, non_numeric_df], axis=1)
+    
+    # Проверка
+    miss_after = df_final.isnull().sum().sum()
+    print(f"Пропусков до: {df.isnull().sum().sum()} -> После: {miss_after}")
+    print("="*60)
+    
+    return df_final
+
+# --- ПРИМЕР ЗАПУСКА ---
+# target_variable = 'Гармония Бессмертия' # Укажите вашу целевую переменную
+# df_filled = perform_advanced_imputation(df_engineered, drop_threshold=0.75, target_col=target_variable)

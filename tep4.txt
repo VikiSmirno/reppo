@@ -1,0 +1,199 @@
+Этап 4. Двухуровневая очистка от выбросов
+
+
+
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import IsolationForest
+from sklearn.svm import OneClassSVM
+from sklearn.cluster import DBSCAN
+
+# Пытаемся импортировать UMAP для визуализации
+try:
+    import umap
+    UMAP_AVAILABLE = True
+except ImportError:
+    UMAP_AVAILABLE = False
+    print("[INFO] Библиотека 'umap-learn' не найдена. Визуализация будет пропущена, но очистка выполнится.")
+
+def perform_outlier_removal(df: pd.DataFrame, target_col: str = None, vote_threshold: int = 2):
+    """
+    Универсальный пайплайн очистки от выбросов (Этап 4).
+    
+    Параметры:
+    df (pd.DataFrame): Датафрейм с данными.
+    target_col (str): Имя целевой переменной (она исключается из поиска аномалий).
+    vote_threshold (int): Сколько алгоритмов из 3 (IsoForest, SVM, DBSCAN) должны признать точку аномалией, 
+                          чтобы она была удалена. 2 = большинство, 3 = единогласно.
+    """
+    
+    # Отделяем целевую переменную, чтобы не удалять "редкие" правильные ответы
+    df_clean = df.copy()
+    if target_col and target_col in df_clean.columns:
+        y = df_clean[target_col]
+        X = df_clean.drop(columns=[target_col])
+    else:
+        y = None
+        X = df_clean.copy()
+        
+    # Работаем только с числовыми данными
+    X_numeric = X.select_dtypes(include=[np.number])
+    initial_shape = df.shape
+    
+    print("="*60)
+    print("ЭТАП 4: ДВУХУРОВНЕВАЯ ОЧИСТКА ОТ ВЫБРОСОВ")
+    print("="*60)
+    print(f"Размер датасета до очистки: {initial_shape}")
+
+    # ---------------------------------------------------------
+    # УРОВЕНЬ 1: ОДНОМЕРНЫЙ АНАЛИЗ (UNIVARIATE CONSENSUS)
+    # ---------------------------------------------------------
+    print(f"\n[1] ОДНОМЕРНЫЙ АНАЛИЗ (IQR + Robust Z-score)")
+    
+    outlier_indices_level_1 = set()
+    
+    for col in X_numeric.columns:
+        series = X_numeric[col].dropna()
+        
+        # --- Метод 1: IQR ---
+        Q1 = series.quantile(0.25)
+        Q3 = series.quantile(0.75)
+        IQR = Q3 - Q1
+        lower = Q1 - 1.5 * IQR
+        upper = Q3 + 1.5 * IQR
+        idx_iqr = series[(series < lower) | (series > upper)].index
+        
+        # --- Метод 2: Robust Z-score (MAD) ---
+        median = series.median()
+        # median_abs_deviation устойчив к выбросам
+        mad = stats.median_abs_deviation(series)
+        
+        if mad == 0:
+            # Если MAD=0 (например, колонка почти константна), Z-score не применим
+            idx_z = []
+        else:
+            # 0.6745 - коэффициент приведения к нормальному распределению
+            modified_z_scores = 0.6745 * (series - median) / mad
+            idx_z = series[np.abs(modified_z_scores) > 3.5].index
+            
+        # --- ПЕРЕСЕЧЕНИЕ (CONSENSUS) ---
+        # Считаем выбросом только если ОБА метода согласны
+        common_outliers = set(idx_iqr).intersection(set(idx_z))
+        outlier_indices_level_1.update(common_outliers)
+        
+    print(f"  Найдено строк с грубыми статистическими выбросами: {len(outlier_indices_level_1)}")
+    
+    # Удаляем выбросы первого уровня
+    X_numeric = X_numeric.drop(index=outlier_indices_level_1)
+    if y is not None:
+        y = y.drop(index=outlier_indices_level_1)
+        
+    print(f"  -> Выбросы уровня 1 удалены. Текущий размер: {X_numeric.shape}")
+
+    # ---------------------------------------------------------
+    # УРОВЕНЬ 2: МНОГОМЕРНЫЙ АНАЛИЗ (MULTIVARIATE ENSEMBLE)
+    # ---------------------------------------------------------
+    print(f"\n[2] МНОГОМЕРНЫЙ АНАЛИЗ (АНСАМБЛЬ)")
+    
+    # Масштабирование обязательно для метрических алгоритмов
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_numeric)
+    
+    # 1. Isolation Forest
+    iso = IsolationForest(contamination=0.05, random_state=42, n_jobs=-1)
+    preds_iso = iso.fit_predict(X_scaled)
+    # Sklearn возвращает -1 для аномалий, 1 для нормы. Превращаем в (1=аномалия, 0=норма)
+    mask_iso = np.where(preds_iso == -1, 1, 0)
+    
+    # 2. One-Class SVM (SGD версия быстрее для больших данных, но используем стандартный для точности)
+    # nu - верхняя граница доли ошибок (выбросов)
+    oc_svm = OneClassSVM(nu=0.05) 
+    preds_svm = oc_svm.fit_predict(X_scaled)
+    mask_svm = np.where(preds_svm == -1, 1, 0)
+    
+    # 3. DBSCAN
+    # eps нужно подбирать, но для Scaled данных 2.0 - это 2 стандартных отклонения (безопасный радиус)
+    dbscan = DBSCAN(eps=2.0, min_samples=10)
+    preds_db = dbscan.fit_predict(X_scaled)
+    mask_db = np.where(preds_db == -1, 1, 0)
+    
+    # --- ГОЛОСОВАНИЕ ---
+    votes = mask_iso + mask_svm + mask_db
+    
+    # Индексы, где количество голосов >= порога
+    # np.where возвращает кортеж индексов массива, нам нужны индексы датафрейма
+    anomaly_indices_pos = np.where(votes >= vote_threshold)[0]
+    outlier_indices_level_2 = X_numeric.index[anomaly_indices_pos]
+    
+    print(f"  Голосование алгоритмов (Порог >= {vote_threshold}):")
+    print(f"  - Isolation Forest нашел: {mask_iso.sum()}")
+    print(f"  - One-Class SVM нашел: {mask_svm.sum()}")
+    print(f"  - DBSCAN нашел: {mask_db.sum()}")
+    print(f"  -> ИТОГО на удаление (пересечение): {len(outlier_indices_level_2)}")
+
+    # ---------------------------------------------------------
+    # ВИЗУАЛИЗАЦИЯ (UMAP)
+    # ---------------------------------------------------------
+    if UMAP_AVAILABLE and len(X_numeric) > 50:
+        print(f"\n[3] ВИЗУАЛИЗАЦИЯ (UMAP)")
+        try:
+            # Снижаем размерность до 2D
+            reducer = umap.UMAP(random_state=42, n_jobs=1) # n_jobs=1 для стабильности
+            embedding = reducer.fit_transform(X_scaled)
+            
+            plt.figure(figsize=(10, 6))
+            
+            # Рисуем "нормальные" точки
+            normal_mask = ~X_numeric.index.isin(outlier_indices_level_2)
+            # Нам нужны позиции в массиве embedding, соответствующие нормальным индексам
+            # Проще создать булеву маску по длине массива
+            bool_mask_remove = np.isin(X_numeric.index, outlier_indices_level_2)
+            
+            plt.scatter(embedding[~bool_mask_remove, 0], embedding[~bool_mask_remove, 1], 
+                        c='blue', s=5, alpha=0.5, label='Чистые данные')
+            
+            # Рисуем аномалии
+            plt.scatter(embedding[bool_mask_remove, 0], embedding[bool_mask_remove, 1], 
+                        c='red', s=15, marker='x', label='Удаляемые аномалии')
+            
+            plt.title("Проекция UMAP: Результат работы ансамбля")
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.show()
+        except Exception as e:
+            print(f"Ошибка при визуализации: {e}")
+
+    # ---------------------------------------------------------
+    # ФИНАЛЬНАЯ СБОРКА
+    # ---------------------------------------------------------
+    # Удаляем выбросы второго уровня
+    X_final = X_numeric.drop(index=outlier_indices_level_2)
+    
+    # Присоединяем нечисловые колонки обратно (если они были)
+    cols_non_numeric = df_clean.select_dtypes(exclude=[np.number]).columns
+    if len(cols_non_numeric) > 0:
+        X_final = X_final.join(df_clean[cols_non_numeric])
+        
+    # Присоединяем таргет обратно (по индексам)
+    if y is not None:
+        y_final = y.loc[X_final.index]
+        df_final = X_final.join(y_final)
+    else:
+        df_final = X_final
+
+    removed_total = initial_shape[0] - df_final.shape[0]
+    percent_removed = (removed_total / initial_shape[0]) * 100
+    
+    print(f"\nИтого удалено строк: {removed_total} ({percent_removed:.2f}%)")
+    print(f"Финальный размер: {df_final.shape}")
+    print("="*60)
+    
+    return df_final
+
+# --- ПРИМЕР ИСПОЛЬЗОВАНИЯ ---
+# df_clean = perform_outlier_removal(df_filled, target_col='Гармония Бессмертия', vote_threshold=2)
